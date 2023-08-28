@@ -27,7 +27,7 @@ import logging
 import re
 import requests
 import shutil
-import subprocess
+#import subprocess
 import sys
 import tempfile
 
@@ -35,27 +35,34 @@ import os
 
 from hashlib import file_digest
 from os.path import join
+from string import hexdigits
+from subprocess import check_output, Popen, PIPE
 from typing import Dict, Final, List
 
 API_MPV: Final[str] = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
 API_YTDLP: Final[str] = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 CRITERIA_YTDLP: Final[str] = "yt-dlp.exe"
-CRITERIA_FFMPEG: Final[str] = r"ffmpeg\-x86\_64\-git\-[0-9a-f]{9}\.7z"
-CRITERIA_HASH: Final[str] = r"open\-in-mpv\-updates\-[0-9]{8}\.sig"
-CRITERIA_MPV: Final[str] = r"^mpv\-x86\_64\-[0-9]{8}\-git\-[0-9a-f]{7}\.7z"
+CRITERIA_FFMPEG: Final[str] = r"ffmpeg\-x86\_64\-v3\-git\-[0-9a-f]{9}\.7z"
+CRITERIA_MPV: Final[str] = r"^mpv\-x86\_64\-v3\-[0-9]{8}\-git\-[0-9a-f]{7}\.7z"
+CRITERIA_SIG_FILE: Final[str] = 'open-in-mpv-updates'
 FILES: Final[List[str]] = [
     "ffmpeg.exe", "mpv.exe", "yt-dlp.exe"
 ]
 FILES_SEARCH: Final[List[str]] = [
     "ffmpeg-x86_64-git", "mpv-x86_64", CRITERIA_YTDLP
 ]
+HASH_ALGORITHM: Final[str] = 'blake2b'
 LOG: logging.Logger = logging.getLogger("mpv-updater-task")
-MPV_LOCATION: Final[str] = join(os.environ["ProgramFiles"], "open-in-mpv")
-TAR: Final[List] = ['tar', '-xf']
-
+TAR: Final[List[str]] = ['tar', '-xf']
 HEADERS: Dict[str, str] = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
 }
+
+# Used to expose functions for unit testing.
+__all__ = [
+    'download_file', 'decompress', 'fetch_archives', 'find_files', 'find_signature_file',
+    'hash_file_parse', 'hash_verify', 'process_active', 'process_terminate'
+]
 
 def download_file(path: str, url: str) -> str | None:
     filename: str = url.split('/')[-1]
@@ -64,21 +71,17 @@ def download_file(path: str, url: str) -> str | None:
         with requests.get(url, stream=True, headers=HEADERS) as r:
             with open(join(path, filename), 'wb') as f:
                 shutil.copyfileobj(r.raw, f)
-    except Exception as e:
-        LOG.exception("Failed to download file from {} url.".format(url))
+    except Exception:
+        LOG.exception(f"Failed to download file from {url}.")
         return None
     
     return filename
 
-def decompress(command: List, v: List[str]) -> bool:
-    filepath: str = join(v[0], v[1])
+def decompress(command: List[str], filepath: str) -> bool:
     command.append(filepath)
-    
-    process: subprocess.Popen = subprocess.Popen(command, 
-                                                 stdout=subprocess.PIPE, 
-                                                 stderr=subprocess.PIPE)
+    process: Popen = Popen(command, stdout=PIPE, stderr=PIPE)
     command.remove(filepath)
-   
+
     stdout: str = str(process.communicate()[0], "utf-8")
     stderr: str = str(process.communicate()[1], "utf-8")
 
@@ -88,21 +91,22 @@ def decompress(command: List, v: List[str]) -> bool:
     if len(stderr) > 0:
         LOG.error(stderr)
 
-    return process.returncode != 1
+    return process.returncode == 0
 
-def fetch_archives() -> List[str] | None:
+def fetch_archives() -> List[str]:
     ret: List[str] = []
     req = requests.get(API_MPV, headers=HEADERS)
     data = req.json()
 
     try:
         for asset in data['assets']:
-            if re.match(CRITERIA_FFMPEG, asset['name']) or re.match(CRITERIA_MPV, asset['name']):
+            if re.match(CRITERIA_FFMPEG, asset['name']) or \
+                  re.match(CRITERIA_MPV, asset['name']):
                 ret.append(asset['browser_download_url'])
                 LOG.info(f"mpv archive: {asset['name']}")
-    except KeyError as e:
-        LOG.exception("Failed to obtain package mpv from {}".format(API_MPV))
-        return None
+    except KeyError:
+        LOG.exception(f"Failed to obtain package mpv from {API_MPV}")
+        return ret
     
     req = requests.get(API_YTDLP, headers=HEADERS)
     data = req.json()
@@ -110,13 +114,12 @@ def fetch_archives() -> List[str] | None:
     try:
         for asset in data['assets']:
             if CRITERIA_YTDLP in asset['name']:
-                return asset['browser_download_url']
+                 ret.append(asset['browser_download_url'])
     except KeyError as e:
-        LOG.exception("Failed to obtain package {0} from {1}".format(CRITERIA_YTDLP, API_YTDLP))
+        LOG.exception(f"Failed to obtain package {CRITERIA_YTDLP} from {API_YTDLP}")
         return ret
     
     # TODO signature file repository.
-
     return ret
 
 def find_files(extension_filter: str, path: str) -> List[str]:
@@ -124,18 +127,21 @@ def find_files(extension_filter: str, path: str) -> List[str]:
     files: filter = filter(os.path.isfile, os.listdir(path))
 
     for file in files:
-        if extension_filter in file.split(".")[1]:
-            ret.append(file)
+        try:
+            if extension_filter in file.split(".")[1]:
+                ret.append(file)
+        except Exception:
+            continue
         
     return ret
 
 def find_signature_file(path: str) -> str | None:
-    files: filter = filter(os.path.isfile, os.listdir(path))
+    files: filter = filter(None, os.listdir(path))
 
     for file in files:
-        if re.match(CRITERIA_HASH, file):
-            return file
-        
+        if CRITERIA_SIG_FILE in file:
+            return join(path, file)
+    
     return None
 
 def hash_file_parse(path: str, clause: str) -> List[Dict[str, str]]:
@@ -144,7 +150,7 @@ def hash_file_parse(path: str, clause: str) -> List[Dict[str, str]]:
     line: str = None
     ret: List[Dict[str, str]] = []
 
-    if file is None:
+    if file is None or clause is None:
         return []
     
     with open(file, "r") as f:
@@ -159,14 +165,13 @@ def hash_file_parse(path: str, clause: str) -> List[Dict[str, str]]:
                 ret.append({'file': data[0], 'hash': data[1]})
                 continue
             
-            if clause is not None and clause != '*' and data[0] in clause:
+            if clause in data[0]:
                 ret.append({'file': data[0], 'hash': data[1]})
             
-
     return ret
 
-def hash_verify(path: str, clause: str) -> bool:
-    computed_hash: Final[List[Dict[str, str]]] = hash_file_parse(path, clause)
+def hash_verify(path: str, sig_path: str, clause: str) -> bool:
+    computed_hash: Final[List[Dict[str, str]]] = hash_file_parse(sig_path, clause)
     computed_hash_length: Final[int] = len(computed_hash)
     hashes: List[Dict[str, str]] = []
     amount: int = 0
@@ -177,8 +182,12 @@ def hash_verify(path: str, clause: str) -> bool:
         return False
 
     for file in filter(os.path.isfile, os.listdir(path)):
-        with open(file, "rb", buffering=0) as f:
-            hashes.append({'file': file, 'hash': file_digest(f, "blake2b").hexdigest()})
+        if clause == '*':
+            with open(file, "rb", buffering=0) as f:
+                hashes.append({'file': file, 'hash': file_digest(f, HASH_ALGORITHM).hexdigest()})
+        elif clause in file:
+            with open(file, "rb", buffering=0) as f:
+                hashes.append({'file': file, 'hash': file_digest(f, HASH_ALGORITHM).hexdigest()})
 
     amount = len(hashes)
 
@@ -187,9 +196,10 @@ def hash_verify(path: str, clause: str) -> bool:
             for curr_file, curr_hash in current.items():
                 for old_file, old_hash in old.items():
                     if curr_file in old_file:
-                        LOG.info("[{0}/{1}] Verifying {2} with {3} known hash signature".format(verifications, amount, old_file, curr_file))
-                        ret = curr_hash == old_hash
-                        verifications += 1
+                        if (set(curr_hash).issubset(hexdigits)):
+                            LOG.info(f"[{verifications}/{amount}] Verifying hash with known hash signature")
+                            ret = curr_hash == old_hash
+                            verifications += 1
     
     return ret and verifications == computed_hash_length
 
@@ -201,18 +211,19 @@ def process_active(process: str) -> bool:
     '''
     process = process.lower()
     # use buildin check_output right away
-    output: str = subprocess.check_output(['TASKLIST', '/FI', f'imagename eq {process}']).decode('utf-8').lower()
+    output: str = check_output(['TASKLIST', '/FI', f'imagename eq {process}']).decode('utf-8').lower()
     # check in last line for process name
     last_line: str = output.strip().split('\r\n')[-1]
     # because Fail message could be translated
     return last_line.startswith(process)
 
 def process_terminate(exe: str) -> bool:
-    if not process_active(exe + ".exe"):
+    if not process_active(exe):
         return True
     
     try:
-        return os.system(f"taskkill /f /im  {exe}.exe") > 0
+        ret_code: int = os.system(f"taskkill /f /im  {exe}")
+        return ret_code == 128 or ret_code == 0
     except Exception as e:
         LOG.exception("Failed to execute taskkill")
         return False
@@ -249,35 +260,37 @@ def main() -> int:
 
     # Download archives to the new temp directory.
     for archive in archives:
+        LOG.info(f"[{current}/{archives_size}] Downloading {archive.split('/')[-1]}...")
         download_file(tmp.name, archive)
-        LOG.info("[{0}/{1}] Downloading {2}...".format(current, archives_size, archive.split("/")[-1]))
         current += 1
     
+    # TODO fix the signature file path.
+
     # Verify the archives.
-    if not hash_verify(tmp.name, '.tar.gz'):
+    if not hash_verify(tmp.name, None, '.tar.gz'):
         LOG.error("Failed to verify the archives.")
         return 0
     
     # Extract the archives.
     for file in find_files('.tar.gz', tmp.name):
         if not decompress(TAR, [tmp.name, file]):
-            LOG.error("Failed to extract {0} at {1}".format(file, tmp.name))
+            LOG.error(f"Failed to extract {file} at {tmp.name}")
             continue
 
     # Hash verify the contents.
-    if not hash_verify(tmp.name, '*'):
+    if not hash_verify(tmp.name, None, '*'):
         LOG.error("Failed to verify executable.")
         return 0
     
     # Replace out of date executables.
     for file in FILES:
-        if not process_terminate(file.split(".")[0]):
+        if not process_terminate(file):
             LOG.error(f"Failed to terminate process. {file}")
             return 0
         
-        shutil.move(join(tmp.name, file), join(MPV_LOCATION, file))
+        shutil.move(join(tmp.name, file), join(join(os.environ["ProgramFiles"], "open-in-mpv"), file))
     
-    LOG.info(f"Updating completed")
+    LOG.info("Updating completed")
     return 1
 
 if __name__ == '__main__':
